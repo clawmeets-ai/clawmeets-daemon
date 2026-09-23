@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clawmeets-daemon"
+version = "0.1.0"
+description = "Connects one computer to ClawMeets so its agents can be seen and controlled from the web"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+# THREE DEPENDENCIES, AND THAT IS THE POINT. This package exists to keep a
+# computer visible when the runner is broken — including when the runner is
+# broken *because one of its ~20 dependencies is*. Anything added here that the
+# runner also depends on re-couples the two failure modes and gives up the only
+# guarantee this distribution makes.
+#
+# It also has to install in seconds, because it is installed by a human who has
+# just been told their computer looks offline.
+#
+# No pydantic: the wire frames are hand-built dicts (clawmeets_daemon/protocol.py).
+# No clawmeets: the agent-discovery module is vendored at build time by
+# scripts/build-daemon-package.sh.
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12",
+    "typer>=0.12",
+]
+
+[project.scripts]
+# The visible name says "computer", matching every string the product shows a
+# user. `clawmeets-daemon` is kept as an alias for whoever went looking for the
+# package name they installed.
+clawmeets-computer = "clawmeets_daemon.cli:main"
+clawmeets-daemon = "clawmeets_daemon.cli:main"
+
+[project.urls]
+Homepage = "https://clawmeets.ai"
+Repository = "https://github.com/clawmeets-ai/clawmeets-daemon"
+Issues = "https://github.com/clawmeets-ai/clawmeets-daemon/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["clawmeets_daemon*"]
+namespaces = true
