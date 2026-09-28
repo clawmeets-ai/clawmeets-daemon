@@ -25,24 +25,27 @@ machine can host several accounts, each with its own key, its own connection
 process and its own logs under ``~/.clawmeets/computer/<username>/``, so pairing
 a second account never disturbs the first.
 
-The process is detached but NOT supervised: it survives the terminal that
-started it and does not survive a reboot. Starting at login is deliberately out
-of scope for this version — nothing in the repo manages launchd or a Windows
-service outside the server deploy docs, and guessing at one would be a worse
-answer than the explicit ``clawmeets computer start``.
+The process is detached and, by default, registered to start again at login
+(``autostart.py`` — launchd on macOS, a systemd user unit on Linux). It is not
+*supervised*: neither manager is asked to restart it, because that would fight
+``clawmeets computer stop``. So a reboot brings it back and an explicit stop
+keeps it stopped, which is the pair of behaviours a user expects and could not
+get before.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
 import httpx
 import typer
 
-from clawmeets_daemon import client, commands, config as cfg
+from clawmeets_daemon import autostart, client, commands, config as cfg
 from clawmeets_daemon.discovery import popen_detached_kwargs, read_pid, stop_pid
 from clawmeets_daemon.protocol import HOST_ACTION_LABELS, HOST_ACTIONS, HOST_NEVER_LABELS
 
@@ -146,20 +149,60 @@ def _print_consent() -> None:
     )
 
 
+def _mint_pairing_code(session: cfg.UserSession) -> Optional[str]:
+    """Ask the server for a pairing code using the account's own session.
+
+    This is what lets ``clawmeets computer install`` take no arguments. The code
+    was never a second factor — it exists so an UNAUTHENTICATED machine can
+    prove it is acting for an account, and a signed-in machine has already
+    proven that with a stronger credential. Carrying a code from the browser to
+    a terminal was a step the one-command install could not afford.
+
+    Returns None on any failure, and the caller falls back to asking for a code.
+    Minting needs a user JWT specifically (the route refuses agent tokens), which
+    is exactly what the runner persisted at login.
+    """
+    try:
+        response = httpx.post(
+            f"{session.server_url}/me/computers/pairing-code",
+            headers={"Authorization": f"Bearer {session.token}"},
+            timeout=30,
+        )
+    except httpx.HTTPError:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        return str(response.json().get("code") or "") or None
+    except ValueError:
+        return None
+
+
 @app.command()
 def install(
-    code: str = typer.Option(..., "--code", help="The pairing code from the web app."),
+    code: Optional[str] = typer.Option(
+        None, "--code",
+        help="A pairing code from the web app. Omit it when you are already "
+             "signed in on this computer — one is fetched for you.",
+    ),
     server: Optional[str] = typer.Option(
         None, "--server", "-s", help="Server URL (defaults to https://clawmeets.ai)."
     ),
     start_after: bool = typer.Option(
         True, "--start/--no-start", help="Start the connection after pairing."
     ),
+    autostart_after: bool = typer.Option(
+        True, "--autostart/--no-autostart",
+        help="Also start the connection automatically when you log in.",
+    ),
     user: Optional[str] = _USER_OPTION,
 ) -> None:
     """Connect this computer to your ClawMeets account.
 
-    Spends the one-time code, stores this machine's own key at
+    Needs no arguments when you are already signed in here: it fetches its own
+    pairing code, so there is nothing to copy out of the browser.
+
+    Spends a one-time code, stores this machine's own key at
     ``~/.clawmeets/computer/<your-username>/config.json`` (mode 0600), and starts
     the connection. The key is minted once and is not recoverable — if it is
     lost, or you disconnect the computer from the web, you pair again with a new
@@ -174,8 +217,12 @@ def install(
     it has never spoken to. If you paired by mistake, disconnect the duplicate
     from the web app.
     """
-    server_url = (server or cfg.DEFAULT_SERVER).rstrip("/")
     username = (user or cfg.local_username()).strip()
+    session = cfg.read_user_session(username)
+    # The saved session knows which server this account signed in to, so
+    # `--server` is only needed when there is no session to ask. Without this a
+    # self-hosted user would silently pair against clawmeets.ai.
+    server_url = (server or (session.server_url if session else cfg.DEFAULT_SERVER)).rstrip("/")
     if not username:
         # Refusing beats pairing anyway: a machine with no account reports no
         # agents forever, and finding that out costs a pairing code, which is
@@ -189,6 +236,32 @@ def install(
         )
         raise typer.Exit(1)
     cfg.use_account(username)
+
+    # No code given: fetch one with the account's own session. This is the path
+    # the one-line installer takes, and the reason it is one line.
+    if not code:
+        if session is None:
+            typer.echo(
+                f'No saved sign-in found for "{username}", so a pairing code '
+                "cannot be fetched for you.\n"
+                "Either sign in first (`clawmeets user login "
+                f"{username}`), or paste a code from the web app:\n"
+                "  clawmeets computer install --code XXXX-XXXX",
+                err=True,
+            )
+            raise typer.Exit(1)
+        code = _mint_pairing_code(session)
+        if not code:
+            typer.echo(
+                f"Could not get a pairing code from {server_url}. Your sign-in "
+                "may have expired.\n"
+                f"Sign in again (`clawmeets user login {username}`), or paste a "
+                "code from the web app:\n"
+                "  clawmeets computer install --code XXXX-XXXX",
+                err=True,
+            )
+            raise typer.Exit(1)
+
     machine = client.describe_machine()
 
     _print_consent()
@@ -229,6 +302,19 @@ def install(
     typer.echo(f"Connected as \"{body.get('name') or machine['hostname']}\".")
     typer.echo(f"  Account:   {username}")
     typer.echo(f"  Key stored at {saved} (only you can read it)")
+
+    # Autostart BEFORE starting: registering is the step that can report a
+    # problem, and a user reading this output should see it next to the pairing
+    # it belongs to rather than after a "connected" line that looks like the end.
+    if autostart_after:
+        state = autostart.enable(username)
+        if state.installed:
+            typer.echo(f"  {state.detail}")
+        elif state.supported:
+            # Not fatal. The machine is paired and about to connect; it just
+            # will not come back by itself, and saying so beats implying it will.
+            typer.echo(f"  Could not set it to start at login: {state.detail}")
+            typer.echo("  Run `clawmeets computer autostart enable` to retry.")
 
     if start_after:
         _start_detached(username)
@@ -272,8 +358,23 @@ def _start_detached(username: str) -> None:
         proc = subprocess.Popen(
             argv, stdout=out, stderr=err, **popen_detached_kwargs()
         )
-    pid_file.write_text(str(proc.pid))
-    typer.echo(f"Connected in the background (PID {proc.pid}).")
+    # The child writes the pidfile itself once it holds the account's lock
+    # (`_claim_instance`), so the file always names the process that WON. The
+    # one launchd started at login moments ago may be that process, in which
+    # case this child exits at once — say which one is connected, not this one.
+    pid = proc.pid
+    for _ in range(30):
+        running = read_pid(pid_file)
+        if running:
+            pid = running
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    if pid != proc.pid:
+        typer.echo(f"Already connected (PID {pid}).")
+        return
+    typer.echo(f"Connected in the background (PID {pid}).")
     typer.echo(f"  Logs: {stdout_log}")
     typer.echo(f"        {stderr_log}")
 
@@ -284,6 +385,43 @@ def start(user: Optional[str] = _USER_OPTION) -> None:
     _resolve_account(user)
     config = _require_config()
     _start_detached(config.username or cfg.active_account())
+
+
+def _claim_instance():
+    """Become this account's one connection on this machine, or return None.
+
+    Two connections for one account both report to the same computer record,
+    and the page shows whichever spoke last — so a login item started with a
+    bare PATH and a terminal-started one with a full PATH made the model row
+    flip between green and a false warning every few seconds. Nothing prevented
+    it: ``computer install`` loads the login item (which launchd starts at once)
+    and then starts a detached one too.
+
+    An exclusive ``flock`` held for the life of the process, rather than a
+    pidfile check: both starters race within milliseconds of each other, and
+    only the kernel can make exactly one of them win. The lock dies with the
+    process — including across the ``os.execv`` of an update, after which the
+    new image claims it again. The returned handle must stay referenced.
+    Windows has no ``fcntl``; there the pidfile check in ``_start_detached`` is
+    the only guard, as before.
+    """
+    lock_path = cfg.computer_dir() / "computer.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a")
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return None
+    # Written by the winner itself, so `stop` / `status` see a connection that
+    # launchd started, not only one this CLI spawned.
+    cfg.pid_path().write_text(str(os.getpid()))
+    return handle
 
 
 @app.command()
@@ -297,6 +435,13 @@ def run(user: Optional[str] = _USER_OPTION) -> None:
     """
     _resolve_account(user)
     config = _require_config()
+    lock = _claim_instance()
+    if lock is None:
+        typer.echo(
+            f"Already connected (PID {read_pid(cfg.pid_path()) or 'unknown'}).",
+            err=True,
+        )
+        return
     try:
         asyncio.run(client.run(config))
     except KeyboardInterrupt:
@@ -419,6 +564,62 @@ def update(user: Optional[str] = _USER_OPTION) -> None:
         typer.echo("Restarting the connection so the new version takes effect…")
         stop_pid(cfg.pid_path())
         _start_detached(account)
+
+
+autostart_app = typer.Typer(
+    name="autostart",
+    help="Start this computer's connection automatically when you log in.",
+    no_args_is_help=True,
+)
+app.add_typer(autostart_app, name="autostart")
+
+
+def _report(state: autostart.AutostartState) -> None:
+    """Print one autostart outcome, and exit non-zero when it is not what was asked.
+
+    ``supported=False`` exits 0: "this platform has no mechanism" is a complete,
+    correct answer to the question, and a red exit would make the installer treat
+    a Windows machine as a failed install.
+    """
+    typer.echo(state.detail)
+    if state.path:
+        typer.echo(f"  {state.path}")
+    if state.supported and not state.installed:
+        raise typer.Exit(1)
+
+
+@autostart_app.command("enable")
+def autostart_enable(user: Optional[str] = _USER_OPTION) -> None:
+    """Start this computer's connection when you log in.
+
+    This is on by default when you connect a computer; run it by hand after a
+    `disable`, or if registering failed at install time.
+    """
+    account = _resolve_account(user)
+    _require_config()
+    _report(autostart.enable(account))
+
+
+@autostart_app.command("disable")
+def autostart_disable(user: Optional[str] = _USER_OPTION) -> None:
+    """Stop starting this computer's connection at login.
+
+    Leaves a running connection alone — this is about next time you log in, not
+    about now. Use `clawmeets computer stop` for now.
+    """
+    account = _resolve_account(user)
+    state = autostart.disable(account)
+    typer.echo(state.detail)
+
+
+@autostart_app.command("status")
+def autostart_status(user: Optional[str] = _USER_OPTION) -> None:
+    """Will this computer reconnect by itself after a restart?"""
+    account = _resolve_account(user)
+    state = autostart.status(account)
+    typer.echo(state.detail)
+    if state.path:
+        typer.echo(f"  {state.path}")
 
 
 def main() -> None:

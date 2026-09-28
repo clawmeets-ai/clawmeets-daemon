@@ -359,3 +359,53 @@ def append_log(line: str, *, error: bool = False) -> None:
             fh.write(text + "\n")
     except OSError:
         pass
+
+
+@dataclass(frozen=True)
+class UserSession:
+    """The runner's saved sign-in for one account, as this process needs it.
+
+    Read-only and read-through: the daemon never writes here. It exists so
+    ``clawmeets computer install`` can mint its OWN pairing code instead of
+    making the user carry one from the browser to a terminal — the code was only
+    ever a way to prove "the human at this machine is the account holder", and a
+    session the runner already persisted proves exactly that.
+
+    A missing file, a missing token, or anything unparseable is all one answer
+    (``None`` from :func:`read_user_session`): the caller falls back to asking
+    for a code, which always works.
+    """
+
+    username: str
+    server_url: str
+    token: str
+
+
+def read_user_session(username: str = "") -> Optional[UserSession]:
+    """The runner's saved session for ``username`` (or the logged-in account).
+
+    Reads ``~/.clawmeets/config/<username>/settings.json`` — the runner's file,
+    not one of ours. That is a deliberate one-way dependency on a stable path
+    the runner has written for as long as ``clawmeets user login`` has existed,
+    and it is guarded the way every other cross-distribution read here is:
+    never raises, returns None on anything unexpected.
+    """
+    name = (username or local_username()).strip()
+    if not name:
+        return None
+    path = data_dir() / "config" / name / "settings.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    user = data.get("user")
+    token = (user or {}).get("token") if isinstance(user, dict) else None
+    if not token:
+        return None
+    return UserSession(
+        username=name,
+        server_url=str(data.get("server_url") or DEFAULT_SERVER).rstrip("/"),
+        token=str(token),
+    )

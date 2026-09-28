@@ -27,11 +27,13 @@ this whole feature exists to escape.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -96,6 +98,95 @@ def snapshot(username: str) -> list[dict]:
     page instead of lingering because no event mentioned it.
     """
     return scan_agents(agents_dir(cfg.data_dir()), username)
+
+
+# How often the machine re-asks which model CLIs are installed and signed in.
+# They change when a human installs a CLI or completes a browser sign-in —
+# minutes apart at the fastest — so a check every five minutes is prompt enough
+# while keeping five `--version` subprocesses off the 30-second roster scan.
+MODEL_CLI_RECHECK_SECONDS = 300
+MODEL_CLIS_NAME = "model_clis.json"
+
+
+def probe_model_clis() -> Optional[list[dict]]:
+    """Which model CLIs are installed and signed in, as the server wants them.
+
+    Shells ``clawmeets doctor --model-clis`` rather than probing the binaries
+    here. That indirection is the point: ``clawmeets/doctor.py`` owns the table
+    of which CLIs exist, what each one's binary is called and where it leaves its
+    credential, and a second copy in this distribution would drift — the web
+    checklist would then claim a model CLI was missing while `clawmeets doctor`
+    in the same terminal said it was fine. One definition, asked over a
+    subprocess boundary.
+
+    Returns None when the runner is absent or the probe fails: this machine
+    cannot tell, and saying ``[]`` would tell the server that nothing is
+    installed — the checklist row would turn into a warning on a machine where
+    everything works. Blocking (it shells a subprocess), so async callers run it
+    in a worker thread.
+    """
+    binary = clawmeets_bin()
+    if binary is None:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "doctor", "--model-clis"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        # An older runner with no `--model-clis` flag lands here. Not an error
+        # worth logging on a timer: the server simply has no observation to show,
+        # which is exactly what an un-upgraded machine should produce.
+        return None
+    try:
+        parsed = json.loads(result.stdout or "[]")
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def saved_model_clis() -> Optional[dict]:
+    """The last successful check, as ``{"checked_at": iso, "clis": [...]}``.
+
+    Kept on disk next to the account's credential so a restarted connection
+    reports what it already knows instead of nothing, and so a check that
+    cannot run right now (a runner mid-upgrade, a login item started with a
+    bare PATH) falls back to the last real answer rather than a wrong one.
+    """
+    try:
+        data = json.loads((cfg.computer_dir() / MODEL_CLIS_NAME).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("clis"), list):
+        return None
+    return {"checked_at": str(data.get("checked_at") or ""), "clis": data["clis"]}
+
+
+def check_model_clis() -> Optional[dict]:
+    """Probe now; save and return a fresh result, else the last saved one.
+
+    The saved result keeps its own ``checked_at`` when it is the fallback, so the
+    page's "last checked" says honestly how old the answer is.
+    """
+    clis = probe_model_clis()
+    if clis is None:
+        return saved_model_clis()
+    report = {"checked_at": datetime.now(timezone.utc).isoformat(), "clis": clis}
+    path = cfg.computer_dir() / MODEL_CLIS_NAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(report))
+        os.replace(tmp, path)
+    except OSError:
+        pass  # Reporting still works; only the restart fallback is lost.
+    return report
 
 
 def _lifecycle_argv(binary: str, verb: str, agent: str, username: str) -> list[str]:

@@ -118,6 +118,10 @@ class ComputerClient:
     def __init__(self, config: cfg.ComputerConfig) -> None:
         self._config = config
         self._version = commands.daemon_version()
+        # The last model-CLI check, from disk until this process has run one.
+        # Frames only ever READ this; the probe runs in `_model_cli_checks`, off
+        # the event loop, so a slow `doctor` cannot delay a heartbeat.
+        self._model_clis: Optional[dict] = commands.saved_model_clis()
 
     # ----------------------------------------------------------------- frames
 
@@ -129,7 +133,21 @@ class ComputerClient:
         }
         if result is not None:
             frame["result"] = result
+        self._add_model_clis(frame)
         return frame
+
+    def _add_model_clis(self, frame: dict) -> None:
+        """Attach the last check, if there has ever been one.
+
+        Omitted rather than ``[]`` when nothing is known: to the server a missing
+        field means "this machine has not said", which leaves the checklist row
+        waiting instead of claiming nothing is installed. It rides every frame
+        rather than its own so a reconnect restores the row immediately.
+        """
+        if self._model_clis is None:
+            return
+        frame["model_clis"] = self._model_clis["clis"]
+        frame["model_clis_checked_at"] = self._model_clis["checked_at"]
 
     def _hello_frame(self) -> dict:
         frame = {
@@ -139,6 +157,7 @@ class ComputerClient:
             "agents": commands.snapshot(self._config.username),
         }
         frame.update(describe_machine())
+        self._add_model_clis(frame)
         return frame
 
     # ------------------------------------------------------------------ loops
@@ -197,10 +216,11 @@ class ComputerClient:
 
             heartbeat = asyncio.create_task(self._heartbeat(ws))
             scanner = asyncio.create_task(self._periodic_scan(ws))
+            model_checks = asyncio.create_task(self._model_cli_checks(ws))
             try:
                 await self._receive(ws)
             finally:
-                for task in (heartbeat, scanner):
+                for task in (heartbeat, scanner, model_checks):
                     task.cancel()
 
     async def _heartbeat(self, ws) -> None:
@@ -219,6 +239,20 @@ class ComputerClient:
         while True:
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
             await ws.send(json.dumps(self._state_frame()))
+
+    async def _model_cli_checks(self, ws) -> None:
+        """Re-check the model CLIs now, then every few minutes, and report.
+
+        Starts with a check because a (re)connect is the moment most likely to
+        follow a user installing or signing in to something. Every result is
+        reported, even an unchanged one, so the page's "last checked" moves.
+        """
+        while True:
+            report = await asyncio.to_thread(commands.check_model_clis)
+            if report is not None:
+                self._model_clis = report
+                await ws.send(json.dumps(self._state_frame()))
+            await asyncio.sleep(commands.MODEL_CLI_RECHECK_SECONDS)
 
     async def _receive(self, ws) -> None:
         try:

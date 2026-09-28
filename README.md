@@ -30,7 +30,7 @@ Then, in the ClawMeets web app, open **Computers**, press **+** to get a pairing
 code, and run:
 
 ```bash
-clawmeets computer install --code XXXX-XXXX
+clawmeets computer install --code XXXX-XXXX --user <your-username>
 ```
 
 (`clawmeets computer …` is the same program, reached through the runner's CLI.
