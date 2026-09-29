@@ -27,6 +27,7 @@ and a machine that would accept a remote delete would route around that.
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 # --- frame types -----------------------------------------------------------
@@ -42,25 +43,119 @@ HOST_ACCEPTED = "host_accepted"
 
 # --- the allowlist ---------------------------------------------------------
 
-HOST_ACTIONS: tuple[str, ...] = ("start", "stop", "restart", "status", "update")
+HOST_ACTIONS: tuple[str, ...] = (
+    "start", "stop", "restart", "status", "update", "env_set", "env_unset",
+)
 
-HOST_AGENT_ACTIONS: frozenset[str] = frozenset({"start", "stop", "restart"})
+HOST_AGENT_ACTIONS: frozenset[str] = frozenset(
+    {"start", "stop", "restart", "env_set", "env_unset"}
+)
+
+# Actions that change one agent's env-var store and so also need a KEY (and,
+# for ``env_set``, a VALUE — which this machine writes and never sends back).
+HOST_ENV_ACTIONS: frozenset[str] = frozenset({"env_set", "env_unset"})
+
+# The env-var store's key rule, restated. The canonical copy is
+# ``clawmeets/utils/agent_processes.py`` (ENV_KEY_PATTERN / ENV_RESERVED_PREFIX);
+# the parity test pins this to it.
+ENV_KEY_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
+ENV_RESERVED_PREFIX = "CLAWMEETS_"
+# A generous ceiling for one secret (a PEM key fits), small enough that a
+# pasted file cannot ride a websocket frame into someone's env.
+ENV_VALUE_MAX_BYTES = 8192
 
 HOST_ACTION_LABELS: dict[str, str] = {
     "start": "Start one of your agents",
     "stop": "Stop one of your agents",
     "restart": "Restart one of your agents",
     "status": "Report which of them are running",
-    "update": "Update its own connection software",
+    "update": "Update the ClawMeets software on it (clawmeets and its connection software)",
+    "env_set": "Add or replace an environment variable for one of your agents",
+    "env_unset": "Remove an environment variable from one of your agents",
 }
 
 HOST_NEVER_LABELS: tuple[str, ...] = (
-    "Run any other command",
-    "Open, read, copy or send your files",
+    "Read back or send the value of an environment variable",
     "Install or change anything else",
     "Delete an agent — only you can, here in the browser",
     "Reach any other computer or account",
 )
+
+# The rest of the truth about this connection, next to the fixed list. The
+# allowlist bounds what the SERVER can ask for; it is not a bound on what runs
+# here, because the agents it starts act as the user.
+HOST_AGENTS_NOTE = (
+    "The agents it runs act as you and can run commands on this computer."
+)
+TERMINAL_ON_LABEL = (
+    "Terminal: on. You can open a full shell on this computer, as you, from "
+    "your Computer page. Turn it off on this machine with "
+    "`clawmeets computer terminal disable`."
+)
+TERMINAL_OFF_LABEL = (
+    "Terminal: off. Turn it on on this machine with "
+    "`clawmeets computer terminal enable`."
+)
+
+# --- the terminal channel --------------------------------------------------
+#
+# NOT an action, and deliberately outside HOST_ACTIONS: the allowlist above is
+# the fixed set of things the server can ask this computer to do, and the
+# terminal is a separate, unconstrained shell the user opens from their own
+# Computer page. It is on by default and the user turns it off ON THE MACHINE
+# (`clawmeets computer terminal disable`); no frame can change that switch.
+#
+# It adds no reach the connection did not already have: every agent this
+# computer runs executes commands as the user with permission prompts off, and
+# "start an agent" is on the allowlist. The terminal gives the user that same
+# access directly.
+
+# Server -> machine.
+TERM_OPEN = "term_open"        # {session_id, cols, rows}
+TERM_INPUT = "term_input"      # {session_id, data_b64}
+TERM_RESIZE = "term_resize"    # {session_id, cols, rows}
+TERM_ACK = "term_ack"          # {session_id, bytes}  flow-control credit
+TERM_CLOSE = "term_close"      # {session_id}
+# Machine -> server.
+TERM_OPENED = "term_opened"    # {session_id, ok, detail}
+TERM_OUTPUT = "term_output"    # {session_id, data_b64}
+TERM_EXIT = "term_exit"        # {session_id, code, reason}
+
+TERMINAL_FRAMES: tuple[str, ...] = (
+    TERM_OPEN, TERM_INPUT, TERM_RESIZE, TERM_ACK, TERM_CLOSE,
+    TERM_OPENED, TERM_OUTPUT, TERM_EXIT,
+)
+
+TERM_MAX_SESSIONS = 3
+# One input frame. A paste larger than this is chunked by the browser.
+TERM_MAX_INPUT_BYTES = 16384
+TERM_IDLE_SECONDS = 15 * 60
+TERM_MAX_SECONDS = 8 * 3600
+# The machine stops reading the shell's output once this much is sent and not
+# yet acknowledged by the browser, so a runaway `yes` blocks in the kernel
+# instead of flooding the relay and freezing the tab.
+TERM_UNACKED_LIMIT = 256 * 1024
+TERM_MAX_COLS = 1000
+TERM_MAX_ROWS = 500
+
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+def validate_session_id(value: object) -> str:
+    """The session id, or raise ``ValueError``. It keys dicts on both ends."""
+    if not isinstance(value, str) or not _SESSION_ID_RE.match(value):
+        raise ValueError("invalid terminal session id")
+    return value
+
+
+def validate_size(cols: object, rows: object) -> tuple[int, int]:
+    """``(cols, rows)`` clamped to a sane window, or raise ``ValueError``."""
+    try:
+        c, r = int(cols), int(rows)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError("terminal size must be two integers")
+    return max(1, min(c, TERM_MAX_COLS)), max(1, min(r, TERM_MAX_ROWS))
+
 
 CLOSE_BAD_TOKEN = 4001
 CLOSE_NO_HOST = 4004
@@ -99,3 +194,36 @@ def validate_host_action(
     else:
         name = None
     return cleaned, name
+
+
+def validate_env_change(
+    action: str, key: Optional[str], value: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """``(key, value)`` for an env action, ``(None, None)`` for any other.
+
+    Raise :class:`HostCommandRejected` on a key outside the store's rule, a
+    ``CLAWMEETS_`` key (agent identity is runner-owned), an ``env_set`` with no
+    value or a value over :data:`ENV_VALUE_MAX_BYTES`. ``env_unset`` drops any
+    value it was handed so a remove can never carry a secret along.
+
+    Messages name the key and never the value — they reach logs and the page.
+    """
+    if action not in HOST_ENV_ACTIONS:
+        return None, None
+    name = (key or "").strip()
+    if not re.match(ENV_KEY_PATTERN, name):
+        raise HostCommandRejected(
+            f"{name!r} is not a valid variable name (A-Z, 0-9 and _, not "
+            f"starting with a digit)"
+        )
+    if name.startswith(ENV_RESERVED_PREFIX):
+        raise HostCommandRejected(f"the {ENV_RESERVED_PREFIX} prefix is reserved")
+    if action == "env_unset":
+        return name, None
+    if value is None:
+        raise HostCommandRejected(f"setting {name} needs a value")
+    if len(value.encode("utf-8")) > ENV_VALUE_MAX_BYTES:
+        raise HostCommandRejected(
+            f"the value for {name} is over {ENV_VALUE_MAX_BYTES // 1024} KB"
+        )
+    return name, value

@@ -2,7 +2,7 @@
 """
 clawmeets_daemon/commands.py
 
-The five things this machine will do when asked, and nothing else.
+The seven things this machine will do when asked, and nothing else.
 
 Every one of them is performed by shelling the CANONICAL ``clawmeets``
 lifecycle command, never by hand-rolling ``Popen`` or ``kill``. That is not
@@ -19,9 +19,16 @@ allowed, resolves the binary, and reports the result.
 ``clawmeets restart`` verb and inventing one here would put a second
 implementation of stop-then-start in the tree.
 
-``update`` is the one action that is about the daemon rather than the agents: it
-upgrades this package and re-executes, so a machine can be kept current without
-the user opening a terminal. It is on the allowlist precisely because the
+``env_set`` / ``env_unset`` shell ``clawmeets env set|unset`` the same way, so
+a key added from the web lands in exactly the store a terminal ``env set``
+writes — the value reaches that command on stdin, never argv. Only key names
+ever come back (on the roster's ``env_keys``); nothing here reads a value.
+
+``update`` is the one action that is about the software rather than the agents:
+it upgrades the runner (``clawmeets``) and this package (``clawmeets-daemon``),
+each with whichever installer owns it, restarts the agents that were running and
+re-executes, so a machine can be kept current without the user opening a
+terminal. It is on the allowlist precisely because the
 alternative — a stale daemon that can never be fixed remotely — is the state
 this whole feature exists to escape.
 """
@@ -38,8 +45,13 @@ from pathlib import Path
 from typing import Optional
 
 from clawmeets_daemon import config as cfg
+from clawmeets_daemon import upgrade
 from clawmeets_daemon.discovery import agents_dir, scan_agents
-from clawmeets_daemon.protocol import HostCommandRejected, validate_host_action
+from clawmeets_daemon.protocol import (
+    HostCommandRejected,
+    validate_env_change,
+    validate_host_action,
+)
 
 # A start can involve resolving a Python environment and importing the runner's
 # dependency stack; a stop waits out the 5-second grace period. 120s is
@@ -206,15 +218,53 @@ def _lifecycle_argv(binary: str, verb: str, agent: str, username: str) -> list[s
     return argv
 
 
-def _run(argv: list[str]) -> subprocess.CompletedProcess:
+def _run(argv: list[str], stdin: Optional[str] = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         argv,
+        input=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         timeout=COMMAND_TIMEOUT_SECONDS,
         check=False,
     )
+
+
+def _env_argv(binary: str, verb: str, key: str, agent_dir: str) -> list[str]:
+    """``clawmeets env <verb> KEY --agent <dir name> --data-dir <data dir>``.
+
+    The agent is named by its exact directory name from this account's own
+    roster, not by short name: ``clawmeets env`` resolves ``--agent`` by prefix,
+    so ``backend`` could also match ``backend-v2``, and a short name alone could
+    match another account's agent. The directory is the one the page showed.
+
+    ``set`` never gets the value on its argument list — ``--value-stdin`` reads
+    it from stdin, so it is not visible to other users in ``ps``.
+    """
+    path = Path(agent_dir)
+    argv = [binary, "env", verb, key, "--agent", path.name, "--data-dir", str(path.parent.parent)]
+    if verb == "set":
+        argv.append("--value-stdin")
+    return argv
+
+
+def _env_change(
+    binary: str, action: str, agent: str, key: str, value: Optional[str], username: str
+) -> CommandResult:
+    """Add/replace or remove one key in one agent's env-var store.
+
+    Every detail string names the key and never the value: it goes to the log
+    and back to the page. The CLI's own output is key-only too (``env set``
+    prints ``{"status": "ok", "key": …}``), so its tail is safe to relay.
+    """
+    row = next((r for r in snapshot(username) if r["short_name"] == agent), None)
+    if row is None:
+        return CommandResult(False, f"{agent} is not set up on this computer")
+    if action == "env_set":
+        proc = _run(_env_argv(binary, "set", key, row["dir"]), stdin=value)
+        return _lifecycle_result(proc, f"Set {key} on {agent}")
+    proc = _run(_env_argv(binary, "unset", key, row["dir"]))
+    return _lifecycle_result(proc, f"Removed {key} from {agent}")
 
 
 def _tail(output: str, limit: int = 300) -> str:
@@ -227,8 +277,17 @@ def _tail(output: str, limit: int = 300) -> str:
     return cleaned[-limit:] if len(cleaned) > limit else cleaned
 
 
-def execute(action: str, agent: Optional[str], username: str) -> CommandResult:
+def execute(
+    action: str,
+    agent: Optional[str],
+    username: str,
+    key: Optional[str] = None,
+    value: Optional[str] = None,
+) -> CommandResult:
     """Run one allowlisted action. Never raises.
+
+    ``key`` / ``value`` are read only by the env actions; ``value`` is a secret
+    and must not reach a log line or a result.
 
     The allowlist is checked HERE, on the machine, even though the server
     already refused anything unlisted before sending. That redundancy is the
@@ -243,6 +302,7 @@ def execute(action: str, agent: Optional[str], username: str) -> CommandResult:
     """
     try:
         cleaned, agent_name = validate_host_action(action, agent)
+        env_key, env_value = validate_env_change(cleaned, key, value)
     except HostCommandRejected as e:
         return CommandResult(False, f"Refused: {e}")
 
@@ -288,7 +348,12 @@ def execute(action: str, agent: Optional[str], username: str) -> CommandResult:
             )
 
         if cleaned == "update":
-            return update_self()
+            return update_self(username)
+
+        if cleaned in ("env_set", "env_unset"):
+            return _env_change(
+                binary, cleaned, agent_name, env_key, env_value, username
+            )
 
     except subprocess.TimeoutExpired:
         return CommandResult(
@@ -331,46 +396,120 @@ def daemon_version() -> str:
         return "unknown"
 
 
-def update_self() -> CommandResult:
-    """Upgrade this package. Does NOT restart — see ``restart_process``.
+def runner_version() -> Optional[str]:
+    """The installed ``clawmeets`` runner's version, or None if it cannot be told.
 
-    Tries ``uv tool upgrade`` first and falls back to ``pip install --upgrade``,
-    matching how the runner is actually installed in the wild. Both name THIS
-    distribution explicitly — there is no code path here that can install
-    anything else, which is what keeps "Install or change anything else" an
-    honest never.
-
-    The split from the restart is deliberate. This runs in a worker thread and
-    its result still has to reach the server; replacing the process image here
-    would discard the frame that tells the user the update landed. So it reports
-    ``restart_required`` and the connection loop re-execs after the frame is on
-    the wire.
+    Asked of the runner's own interpreter, not of this process: the two are
+    usually separate environments (the one-line installer gives each its own
+    uv tool env), so ``importlib.metadata`` here would answer about the wrong
+    copy — or about none. Blocking; async callers use a worker thread.
     """
-    before = daemon_version()
-    attempts: list[list[str]] = []
-    uv = shutil.which("uv")
-    if uv:
-        attempts.append([uv, "tool", "upgrade", "clawmeets-daemon"])
-    attempts.append(
-        [sys.executable, "-m", "pip", "install", "--upgrade", "clawmeets-daemon"]
-    )
+    binary = clawmeets_bin()
+    if binary is None:
+        return None
+    python = upgrade.python_for_script(binary)
+    if python is not None:
+        found = upgrade.installed_version(python, upgrade.RUNNER_DIST)
+        if found:
+            return found
+    # A console script with no readable interpreter (a Windows launcher): the
+    # CLI can say it itself, at the cost of importing it.
+    try:
+        proc = _run([binary, "--version"])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    words = (proc.stdout or "").split()
+    return words[-1] if proc.returncode == 0 and words else None
 
-    last = ""
-    for argv in attempts:
-        try:
-            proc = _run(argv)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            last = str(e)
+
+def _restart_running_agents(username: str) -> tuple[int, list[str]]:
+    """Stop-then-start every agent of this account that is running now.
+
+    An upgrade on disk changes nothing for a runner that already imported the
+    old code, so without this the page would report the new version while every
+    agent kept running the old one. Only agents that are RUNNING are touched —
+    a stopped agent picks up the new code whenever it is next started, and
+    starting it here would override the user's decision to stop it.
+    """
+    binary = clawmeets_bin()
+    if binary is None:
+        return 0, []
+    restarted, failed = 0, []
+    for row in snapshot(username):
+        if row.get("state") != "running":
             continue
-        if proc.returncode == 0:
-            return CommandResult(
-                True,
-                f"Updated the connection software (was {before}); restarting it now",
-                restart_required=True,
-            )
-        last = _tail(proc.stdout)
+        name = row["short_name"]
+        try:
+            _run(_lifecycle_argv(binary, "stop", name, username))
+            started = _run(_lifecycle_argv(binary, "start", name, username))
+        except (OSError, subprocess.SubprocessError):
+            failed.append(name)
+            continue
+        if started.returncode == 0:
+            restarted += 1
+        else:
+            failed.append(name)
+    return restarted, failed
 
-    return CommandResult(False, f"Could not update: {last or 'no installer available'}")
+
+def _describe(label: str, outcome: "upgrade.UpgradeOutcome") -> str:
+    if not outcome.ok:
+        return f"{label}: could not update ({outcome.detail})"
+    if outcome.changed:
+        return f"{label} {outcome.before or '?'} → {outcome.after} (via {outcome.installer})"
+    current = outcome.after or outcome.before
+    return f"{label} {current} is already the latest" if current else f"{label} is up to date"
+
+
+def update_self(username: str = "") -> CommandResult:
+    """Upgrade the runner (``clawmeets``) and this package (``clawmeets-daemon``).
+
+    Each is upgraded in ITS OWN environment with the installer that owns it —
+    uv tool, pipx, pip or ``uv pip`` — found by :mod:`clawmeets_daemon.upgrade`.
+    They are independent: a runner that fails to upgrade does not stop the
+    daemon from upgrading, and vice versa, and the detail says which is which.
+    Both names are fixed there; no code path here can install anything else,
+    which is what keeps "Install or change anything else" an honest never.
+
+    When the runner actually moved, the agents of ``username`` that were
+    running are restarted so they run the new code. When the daemon moved, it
+    reports ``restart_required`` and the connection loop re-execs after the
+    result frame is on the wire — replacing the process image here, in a worker
+    thread, would discard the frame that tells the user the update landed.
+    """
+    parts: list[str] = []
+    ok = True
+
+    binary = clawmeets_bin()
+    if binary is None:
+        parts.append("clawmeets: not found on this computer, so it was not updated")
+        ok = False
+    else:
+        runner = upgrade.upgrade(upgrade.RUNNER_DIST, upgrade.python_for_script(binary))
+        ok = ok and runner.ok
+        parts.append(_describe("clawmeets", runner))
+        if runner.ok and runner.after != runner.before:
+            restarted, failed = _restart_running_agents(username)
+            if restarted:
+                parts.append(
+                    f"restarted {restarted} running agent{'s' if restarted != 1 else ''}"
+                )
+            if failed:
+                ok = False
+                parts.append(f"could not restart {', '.join(failed)}")
+
+    daemon = upgrade.upgrade(upgrade.DAEMON_DIST, upgrade.daemon_python())
+    ok = ok and daemon.ok
+    parts.append(_describe("connection software", daemon))
+
+    return CommandResult(
+        ok,
+        "; ".join(parts),
+        # An unknown "after" (the version could not be read back) still
+        # restarts: a needless re-exec costs a second, a missed one leaves the
+        # old code running indefinitely.
+        restart_required=daemon.ok and (daemon.changed or not daemon.after),
+    )
 
 
 def restart_process() -> None:

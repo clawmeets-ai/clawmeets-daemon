@@ -66,7 +66,7 @@ import os
 import stat
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -77,6 +77,7 @@ DEFAULT_DATA_DIR = os.environ.get(
 
 COMPUTER_SUBDIR = "computer"
 CONFIG_NAME = "config.json"
+TERMINAL_NAME = "terminal.json"
 PID_NAME = "computer.pid"
 STDOUT_LOG_NAME = "stdout.log"
 STDERR_LOG_NAME = "stderr.log"
@@ -305,6 +306,49 @@ def clear_config() -> None:
         config_path().unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def terminal_path() -> Path:
+    return computer_dir() / TERMINAL_NAME
+
+
+def terminal_enabled() -> bool:
+    """Is the terminal switched on at this machine?
+
+    ON unless the user turned it off here. The file only ever records that
+    choice, and only the CLI writes it — the daemon reads it, and nothing that
+    arrives over the socket can reach this function's inputs.
+
+    A file that exists but cannot be read counts as OFF: the user said
+    something about the terminal on this machine, and when we cannot tell what,
+    the shell stays closed.
+
+    Read fresh on every call, no caching, so `disable` takes effect on a
+    running daemon without a restart.
+    """
+    path = terminal_path()
+    if not path.exists():
+        return True
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("enabled") is True
+
+
+def set_terminal_enabled(on: bool) -> Path:
+    """Record the user's choice, at mode 0600. The CLI's job, never the daemon's."""
+    path = terminal_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "enabled": bool(on),
+        "changed_at": datetime.now(UTC).isoformat(),
+    }, indent=2))
+    try:
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+    return path
 
 
 def local_username() -> str:

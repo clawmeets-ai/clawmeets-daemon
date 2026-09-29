@@ -47,7 +47,14 @@ import typer
 
 from clawmeets_daemon import autostart, client, commands, config as cfg
 from clawmeets_daemon.discovery import popen_detached_kwargs, read_pid, stop_pid
-from clawmeets_daemon.protocol import HOST_ACTION_LABELS, HOST_ACTIONS, HOST_NEVER_LABELS
+from clawmeets_daemon.protocol import (
+    HOST_ACTION_LABELS,
+    HOST_ACTIONS,
+    HOST_AGENTS_NOTE,
+    HOST_NEVER_LABELS,
+    TERMINAL_OFF_LABEL,
+    TERMINAL_ON_LABEL,
+)
 
 app = typer.Typer(
     name="clawmeets-computer",
@@ -137,9 +144,12 @@ def _print_consent() -> None:
     The wording is the same list the pairing dialog and the computer's page show,
     and it is generated from the same allowlist the machine enforces.
     """
-    typer.echo("\nWhat ClawMeets will be able to do on this computer:")
+    typer.echo("\nWhat this connection can do:")
+    typer.echo("  The server can ask this computer to do only a fixed set of things:")
     for action in HOST_ACTIONS:
         typer.echo(f"  + {HOST_ACTION_LABELS[action]}")
+    typer.echo(f"  {HOST_AGENTS_NOTE}")
+    typer.echo(f"  {_terminal_label()}")
     typer.echo("\nWhat it will never do:")
     for never in HOST_NEVER_LABELS:
         typer.echo(f"  - {never}")
@@ -545,25 +555,26 @@ def logs(
 
 @app.command()
 def update(user: Optional[str] = _USER_OPTION) -> None:
-    """Update this computer's connection software.
+    """Update ClawMeets on this computer: the runner and the connection software.
 
-    The same action the web app can trigger, run by hand. It upgrades the
-    ``clawmeets-daemon`` package and nothing else; if the connection is running,
-    restart it afterwards to pick up the new version.
+    The same action the web app's Update button triggers, run by hand. It
+    upgrades ``clawmeets`` and ``clawmeets-daemon`` — each with whichever of uv
+    tool / pipx / pip installed it — restarts this account's running agents if
+    the runner changed, and restarts the connection if it changed.
 
-    The package is shared by every account on the machine, so one upgrade covers
-    them all — but only the named account's connection is restarted here, since
-    that is the only one this command was asked about.
+    The packages are shared by every account on the machine, so one upgrade
+    covers them all — but only the named account's agents and connection are
+    restarted here, since that is the only account this command was asked about.
     """
     account = _resolve_account(user)
-    result = commands.update_self()
+    result = commands.update_self(account)
     typer.echo(result.detail)
-    if not result.ok:
-        raise typer.Exit(1)
-    if read_pid(cfg.pid_path()):
+    if result.restart_required and read_pid(cfg.pid_path()):
         typer.echo("Restarting the connection so the new version takes effect…")
         stop_pid(cfg.pid_path())
         _start_detached(account)
+    if not result.ok:
+        raise typer.Exit(1)
 
 
 autostart_app = typer.Typer(
@@ -620,6 +631,54 @@ def autostart_status(user: Optional[str] = _USER_OPTION) -> None:
     typer.echo(state.detail)
     if state.path:
         typer.echo(f"  {state.path}")
+
+
+terminal_app = typer.Typer(
+    name="terminal",
+    help="Allow or stop opening a shell on this computer from the web app. "
+         "On by default.",
+    no_args_is_help=True,
+)
+app.add_typer(terminal_app, name="terminal")
+
+
+def _terminal_label() -> str:
+    return TERMINAL_ON_LABEL if cfg.terminal_enabled() else TERMINAL_OFF_LABEL
+
+
+@terminal_app.command("enable")
+def terminal_enable(user: Optional[str] = _USER_OPTION) -> None:
+    """Let your Computer page open a shell here, as you (the default)."""
+    _resolve_account(user)
+    cfg.set_terminal_enabled(True)
+    typer.echo(
+        "Terminal is on. You can open a shell on this computer, as you, from "
+        "its page in ClawMeets.\n"
+        "Turn it off again with: clawmeets computer terminal disable"
+    )
+
+
+@terminal_app.command("disable")
+def terminal_disable(user: Optional[str] = _USER_OPTION) -> None:
+    """Stop the web app from opening a shell here. Ends open sessions.
+
+    Only a command run on this computer can turn it back on; nothing in the
+    browser can.
+    """
+    _resolve_account(user)
+    cfg.set_terminal_enabled(False)
+    typer.echo(
+        "Terminal is off. Any open terminal sessions end within a few seconds, "
+        "and none can be opened from the web app.\n"
+        "Turn it back on with: clawmeets computer terminal enable"
+    )
+
+
+@terminal_app.command("status")
+def terminal_status(user: Optional[str] = _USER_OPTION) -> None:
+    """Can the web app open a shell on this computer?"""
+    _resolve_account(user)
+    typer.echo(_terminal_label().replace("`", ""))
 
 
 def main() -> None:

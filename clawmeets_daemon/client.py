@@ -3,7 +3,7 @@
 clawmeets_daemon/client.py
 
 The connection loop: stay attached to the server, report what is running on this
-machine, and carry out the five allowed commands.
+machine, and carry out the allowed commands.
 
 ## The one invariant
 
@@ -50,7 +50,17 @@ from clawmeets_daemon.protocol import (
     HOST_HEARTBEAT,
     HOST_HELLO,
     HOST_STATE,
+    TERM_ACK,
+    TERM_CLOSE,
+    TERM_INPUT,
+    TERM_OPEN,
+    TERM_RESIZE,
 )
+from clawmeets_daemon.terminal import TerminalManager
+
+# The server -> machine terminal frames. Everything the machine sends back is
+# built inside ``terminal.py``.
+_TERMINAL_INBOUND = frozenset({TERM_OPEN, TERM_INPUT, TERM_RESIZE, TERM_ACK, TERM_CLOSE})
 
 # The machine re-reports its agent roster on this cadence even when nothing
 # asked it to. 30 seconds is the resolution of "3 of 5 running" on the page: an
@@ -122,6 +132,18 @@ class ComputerClient:
         # Frames only ever READ this; the probe runs in `_model_cli_checks`, off
         # the event loop, so a slow `doctor` cannot delay a heartbeat.
         self._model_clis: Optional[dict] = commands.saved_model_clis()
+        # The installed runner's version. Read off the event loop with the
+        # model-CLI check and again after an update; None until then, and
+        # omitted from frames while None so the page keeps what it last knew.
+        self._runner_version: Optional[str] = None
+        # One writer at a time on the socket: terminal output is sent from its
+        # own tasks now, alongside the heartbeat, the scanner and command
+        # results.
+        self._send_lock = asyncio.Lock()
+
+    async def _send(self, ws, frame: dict) -> None:
+        async with self._send_lock:
+            await ws.send(json.dumps(frame))
 
     # ----------------------------------------------------------------- frames
 
@@ -130,11 +152,17 @@ class ComputerClient:
             "type": HOST_STATE,
             "agents": commands.snapshot(self._config.username),
             "daemon_version": self._version,
+            "terminal_enabled": cfg.terminal_enabled(),
         }
         if result is not None:
             frame["result"] = result
         self._add_model_clis(frame)
+        self._add_runner_version(frame)
         return frame
+
+    def _add_runner_version(self, frame: dict) -> None:
+        if self._runner_version is not None:
+            frame["runner_version"] = self._runner_version
 
     def _add_model_clis(self, frame: dict) -> None:
         """Attach the last check, if there has ever been one.
@@ -155,9 +183,11 @@ class ComputerClient:
             "token": self._config.token,
             "daemon_version": self._version,
             "agents": commands.snapshot(self._config.username),
+            "terminal_enabled": cfg.terminal_enabled(),
         }
         frame.update(describe_machine())
         self._add_model_clis(frame)
+        self._add_runner_version(frame)
         return frame
 
     # ------------------------------------------------------------------ loops
@@ -211,22 +241,35 @@ class ComputerClient:
         url = ws_url(self._config.server_url, self._config.host_id)
         cfg.append_log(f"connecting to {url}")
         async with websockets.connect(url, open_timeout=20, close_timeout=5) as ws:
-            await ws.send(json.dumps(self._hello_frame()))
+            await self._send(ws, self._hello_frame())
             cfg.append_log("connected; reporting what is running here")
 
+            terminals = TerminalManager(
+                lambda frame: self._send(ws, frame),
+                # Report a flipped switch now, not at the next 30 s scan, so
+                # the page's Terminal card follows `enable` / `disable`.
+                on_switch_change=lambda: self._send(ws, self._state_frame()),
+            )
             heartbeat = asyncio.create_task(self._heartbeat(ws))
             scanner = asyncio.create_task(self._periodic_scan(ws))
             model_checks = asyncio.create_task(self._model_cli_checks(ws))
+            watchdog = asyncio.create_task(terminals.watchdog())
             try:
-                await self._receive(ws)
+                await self._receive(ws, terminals)
             finally:
-                for task in (heartbeat, scanner, model_checks):
+                for task in (heartbeat, scanner, model_checks, watchdog):
                     task.cancel()
+                # Nobody can see these shells once the socket is gone, so they
+                # are hung up rather than left running unattended. Shielded:
+                # this `finally` may itself be running under cancellation.
+                await asyncio.shield(
+                    _close_quietly(terminals, "The connection to ClawMeets dropped.")
+                )
 
     async def _heartbeat(self, ws) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-            await ws.send(json.dumps({"type": HOST_HEARTBEAT}))
+            await self._send(ws, {"type": HOST_HEARTBEAT})
 
     async def _periodic_scan(self, ws) -> None:
         """Re-report the roster on a timer.
@@ -238,7 +281,7 @@ class ComputerClient:
         """
         while True:
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-            await ws.send(json.dumps(self._state_frame()))
+            await self._send(ws, self._state_frame())
 
     async def _model_cli_checks(self, ws) -> None:
         """Re-check the model CLIs now, then every few minutes, and report.
@@ -249,12 +292,16 @@ class ComputerClient:
         """
         while True:
             report = await asyncio.to_thread(commands.check_model_clis)
+            self._runner_version = (
+                await asyncio.to_thread(commands.runner_version) or self._runner_version
+            )
             if report is not None:
                 self._model_clis = report
-                await ws.send(json.dumps(self._state_frame()))
+            if report is not None or self._runner_version is not None:
+                await self._send(ws, self._state_frame())
             await asyncio.sleep(commands.MODEL_CLI_RECHECK_SECONDS)
 
-    async def _receive(self, ws) -> None:
+    async def _receive(self, ws, terminals: TerminalManager) -> None:
         try:
             async for raw in ws:
                 try:
@@ -268,6 +315,8 @@ class ComputerClient:
                     continue
                 if kind == HOST_COMMAND:
                     await self._handle_command(ws, frame)
+                elif kind in _TERMINAL_INBOUND:
+                    await terminals.handle(frame)
         except websockets.ConnectionClosed as e:
             if e.code == CLOSE_NO_HOST:
                 raise ComputerDisconnected() from e
@@ -290,24 +339,33 @@ class ComputerClient:
         """
         action = str(frame.get("action") or "")
         agent = frame.get("agent")
+        key = frame.get("key")
         command_id = str(frame.get("command_id") or "")
-        cfg.append_log(f"command: {action} {agent or ''}".rstrip())
+        # The key name is logged; `frame["value"]` (an env_set secret) never is.
+        cfg.append_log(f"command: {action} {agent or ''} {key or ''}".rstrip())
 
         result = await asyncio.to_thread(
-            commands.execute, action, agent, self._config.username
+            commands.execute, action, agent, self._config.username,
+            key, frame.get("value"),
         )
         cfg.append_log(
             f"  -> {'ok' if result.ok else 'failed'}: {result.detail}",
             error=not result.ok,
         )
+        if action == "update":
+            # So the result frame already carries the version the update left.
+            self._runner_version = (
+                await asyncio.to_thread(commands.runner_version) or self._runner_version
+            )
 
-        await ws.send(json.dumps(self._state_frame({
+        await self._send(ws, self._state_frame({
             "command_id": command_id,
             "action": action,
             "agent": agent,
+            "key": key,
             "ok": result.ok,
             "detail": result.detail,
-        })))
+        }))
 
         # An `update` that landed needs this process replaced to take effect,
         # and that is done HERE rather than inside `execute` so the frame above
@@ -318,6 +376,14 @@ class ComputerClient:
         if result.restart_required:
             await asyncio.sleep(0.3)
             commands.restart_process()
+
+
+async def _close_quietly(terminals: TerminalManager, reason: str) -> None:
+    """Hang up every shell; the socket is gone, so the exit frames go nowhere."""
+    try:
+        await terminals.close_all(reason)
+    except Exception as e:
+        cfg.append_log(f"closing terminal sessions failed: {e}", error=True)
 
 
 async def run(config: cfg.ComputerConfig) -> None:

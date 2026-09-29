@@ -35,7 +35,9 @@ and friends) so existing imports and tests continue to resolve.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -235,11 +237,41 @@ def agent_pid_file(agent_dir: Path) -> Path:
     return Path(agent_dir) / "agent.pid"
 
 
+# The per-agent env-var store (``clawmeets/utils/env_store.py`` reads and
+# writes it; it imports these so there is one definition of the file and the
+# key rule). Here because the machine reports key NAMES from this module, and
+# this module is the one copied into the daemon wheel.
+ENV_STORE_FILENAME = "env.json"
+ENV_KEY_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
+ENV_RESERVED_PREFIX = "CLAWMEETS_"
+
+
+def env_key_names(agent_dir: Path) -> list[str]:
+    """Sorted key names in an agent's env-var store. Never the values.
+
+    Missing, unreadable or malformed store -> ``[]``. Keys the runner would
+    ignore (illegal names, the reserved ``CLAWMEETS_`` prefix) are left out, so
+    the list is exactly the variables a skill will actually see.
+    """
+    try:
+        data = json.loads((Path(agent_dir) / ENV_STORE_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    pattern = re.compile(ENV_KEY_PATTERN)
+    return sorted(
+        k for k in data
+        if isinstance(k, str) and pattern.match(k) and not k.startswith(ENV_RESERVED_PREFIX)
+    )
+
+
 def scan_agents(agents_root: Path, username: str) -> list[dict]:
     """One dict per locally registered agent, with its OBSERVED run state.
 
-    ``[{"short_name", "name", "dir", "pid", "state"}, …]`` sorted by
-    ``short_name``, where ``state`` is one of:
+    ``[{"short_name", "name", "dir", "pid", "state", "env_keys"}, …]`` sorted
+    by ``short_name``, where ``env_keys`` is :func:`env_key_names` (names only)
+    and ``state`` is one of:
 
     - ``"running"``   — the pidfile names a live process.
     - ``"crashed"``   — a pidfile exists but the process is gone. The machine
@@ -272,5 +304,6 @@ def scan_agents(agents_root: Path, username: str) -> list[dict]:
             "dir": str(agent_dir),
             "pid": pid,
             "state": state,
+            "env_keys": env_key_names(agent_dir),
         })
     return rows

@@ -36,24 +36,37 @@ clawmeets computer install --code XXXX-XXXX --user <your-username>
 (`clawmeets computer …` is the same program, reached through the runner's CLI.
 If the runner is not installed, use `clawmeets-computer …` directly.)
 
-## What ClawMeets may do on this computer
+## What this connection can do
 
-The complete list. It cannot be extended from the web, and every item is checked
-twice — once by the server before it will send anything, and again here before
-anything runs.
-
-**Allowed**
+**The fixed list.** The server can ask this computer to do only these things,
+and every item is checked twice — once by the server before it will send
+anything, and again here before anything runs:
 
 - Start one of your agents
 - Stop one of your agents
 - Restart one of your agents
 - Report which of them are running
-- Update its own connection software
+- Update the ClawMeets software on it (clawmeets and its connection software)
+- Add, replace or remove an environment variable for one of your agents
+
+**Your agents.** The agents it runs act as you and can run commands on this
+computer.
+
+**The terminal.** On by default: you can open a full shell on this computer, as
+you, from its page in ClawMeets. Turn it off on this machine — only here, never
+from the browser:
+
+    clawmeets computer terminal disable   # ends open sessions within seconds
+    clawmeets computer terminal enable
+    clawmeets computer terminal status
+
+Sessions are hung up when you end them, after 15 minutes idle, after 8 hours,
+or when the connection drops. The server records who opened a session and for
+how long — never what was typed or printed.
 
 **Never**
 
-- Run any other command
-- Open, read, copy or send your files
+- Read back or send the value of an environment variable
 - Install or change anything else
 - Delete an agent — only you can, in the browser
 - Reach any other computer or account
@@ -74,7 +87,7 @@ immediately and for good; reconnecting needs a fresh pairing code.
 | `clawmeets computer stop` | Stop the connection (your agents keep running) |
 | `clawmeets computer status` | Is it connected, and what is running here |
 | `clawmeets computer logs --tail 50` | What the connection has been doing |
-| `clawmeets computer update` | Update this computer's connection software |
+| `clawmeets computer update` | Update ClawMeets on this computer (clawmeets + connection software, via uv tool / pipx / pip) |
 
 ## Where things live
 
