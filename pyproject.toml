@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawmeets-daemon"
-version = "0.1.1"
+version = "0.1.2"
 description = "Connects one computer to ClawMeets so its agents can be seen and controlled from the web"
 license = "MIT"
 readme = "README.md"
