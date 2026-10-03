@@ -43,26 +43,9 @@ HOST_ACCEPTED = "host_accepted"
 
 # --- the allowlist ---------------------------------------------------------
 
-HOST_ACTIONS: tuple[str, ...] = (
-    "start", "stop", "restart", "status", "update", "env_set", "env_unset",
-)
+HOST_ACTIONS: tuple[str, ...] = ("start", "stop", "restart", "status", "update")
 
-HOST_AGENT_ACTIONS: frozenset[str] = frozenset(
-    {"start", "stop", "restart", "env_set", "env_unset"}
-)
-
-# Actions that change one agent's env-var store and so also need a KEY (and,
-# for ``env_set``, a VALUE — which this machine writes and never sends back).
-HOST_ENV_ACTIONS: frozenset[str] = frozenset({"env_set", "env_unset"})
-
-# The env-var store's key rule, restated. The canonical copy is
-# ``clawmeets/utils/agent_processes.py`` (ENV_KEY_PATTERN / ENV_RESERVED_PREFIX);
-# the parity test pins this to it.
-ENV_KEY_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
-ENV_RESERVED_PREFIX = "CLAWMEETS_"
-# A generous ceiling for one secret (a PEM key fits), small enough that a
-# pasted file cannot ride a websocket frame into someone's env.
-ENV_VALUE_MAX_BYTES = 8192
+HOST_AGENT_ACTIONS: frozenset[str] = frozenset({"start", "stop", "restart"})
 
 HOST_ACTION_LABELS: dict[str, str] = {
     "start": "Start one of your agents",
@@ -70,12 +53,10 @@ HOST_ACTION_LABELS: dict[str, str] = {
     "restart": "Restart one of your agents",
     "status": "Report which of them are running",
     "update": "Update the ClawMeets software on it (clawmeets and its connection software)",
-    "env_set": "Add or replace an environment variable for one of your agents",
-    "env_unset": "Remove an environment variable from one of your agents",
 }
 
 HOST_NEVER_LABELS: tuple[str, ...] = (
-    "Read back or send the value of an environment variable",
+    "Read or change your agents' environment variables",
     "Install or change anything else",
     "Delete an agent — only you can, here in the browser",
     "Reach any other computer or account",
@@ -194,36 +175,3 @@ def validate_host_action(
     else:
         name = None
     return cleaned, name
-
-
-def validate_env_change(
-    action: str, key: Optional[str], value: Optional[str]
-) -> tuple[Optional[str], Optional[str]]:
-    """``(key, value)`` for an env action, ``(None, None)`` for any other.
-
-    Raise :class:`HostCommandRejected` on a key outside the store's rule, a
-    ``CLAWMEETS_`` key (agent identity is runner-owned), an ``env_set`` with no
-    value or a value over :data:`ENV_VALUE_MAX_BYTES`. ``env_unset`` drops any
-    value it was handed so a remove can never carry a secret along.
-
-    Messages name the key and never the value — they reach logs and the page.
-    """
-    if action not in HOST_ENV_ACTIONS:
-        return None, None
-    name = (key or "").strip()
-    if not re.match(ENV_KEY_PATTERN, name):
-        raise HostCommandRejected(
-            f"{name!r} is not a valid variable name (A-Z, 0-9 and _, not "
-            f"starting with a digit)"
-        )
-    if name.startswith(ENV_RESERVED_PREFIX):
-        raise HostCommandRejected(f"the {ENV_RESERVED_PREFIX} prefix is reserved")
-    if action == "env_unset":
-        return name, None
-    if value is None:
-        raise HostCommandRejected(f"setting {name} needs a value")
-    if len(value.encode("utf-8")) > ENV_VALUE_MAX_BYTES:
-        raise HostCommandRejected(
-            f"the value for {name} is over {ENV_VALUE_MAX_BYTES // 1024} KB"
-        )
-    return name, value

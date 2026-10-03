@@ -339,14 +339,11 @@ class ComputerClient:
         """
         action = str(frame.get("action") or "")
         agent = frame.get("agent")
-        key = frame.get("key")
         command_id = str(frame.get("command_id") or "")
-        # The key name is logged; `frame["value"]` (an env_set secret) never is.
-        cfg.append_log(f"command: {action} {agent or ''} {key or ''}".rstrip())
+        cfg.append_log(f"command: {action} {agent or ''}".rstrip())
 
         result = await asyncio.to_thread(
             commands.execute, action, agent, self._config.username,
-            key, frame.get("value"),
         )
         cfg.append_log(
             f"  -> {'ok' if result.ok else 'failed'}: {result.detail}",
@@ -362,7 +359,6 @@ class ComputerClient:
             "command_id": command_id,
             "action": action,
             "agent": agent,
-            "key": key,
             "ok": result.ok,
             "detail": result.detail,
         }))

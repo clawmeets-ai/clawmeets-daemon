@@ -47,7 +47,6 @@ anything, and again here before anything runs:
 - Restart one of your agents
 - Report which of them are running
 - Update the ClawMeets software on it (clawmeets and its connection software)
-- Add, replace or remove an environment variable for one of your agents
 
 **Your agents.** The agents it runs act as you and can run commands on this
 computer.
@@ -66,7 +65,7 @@ how long — never what was typed or printed.
 
 **Never**
 
-- Read back or send the value of an environment variable
+- Read or change your agents' environment variables
 - Install or change anything else
 - Delete an agent — only you can, in the browser
 - Reach any other computer or account

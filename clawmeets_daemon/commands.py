@@ -2,7 +2,7 @@
 """
 clawmeets_daemon/commands.py
 
-The seven things this machine will do when asked, and nothing else.
+The five things this machine will do when asked, and nothing else.
 
 Every one of them is performed by shelling the CANONICAL ``clawmeets``
 lifecycle command, never by hand-rolling ``Popen`` or ``kill``. That is not
@@ -18,11 +18,6 @@ allowed, resolves the binary, and reports the result.
 ``restart`` is stop-then-start as two explicit steps, because there is no
 ``clawmeets restart`` verb and inventing one here would put a second
 implementation of stop-then-start in the tree.
-
-``env_set`` / ``env_unset`` shell ``clawmeets env set|unset`` the same way, so
-a key added from the web lands in exactly the store a terminal ``env set``
-writes — the value reaches that command on stdin, never argv. Only key names
-ever come back (on the roster's ``env_keys``); nothing here reads a value.
 
 ``update`` is the one action that is about the software rather than the agents:
 it upgrades the runner (``clawmeets``) and this package (``clawmeets-daemon``),
@@ -49,7 +44,6 @@ from clawmeets_daemon import upgrade
 from clawmeets_daemon.discovery import agents_dir, scan_agents
 from clawmeets_daemon.protocol import (
     HostCommandRejected,
-    validate_env_change,
     validate_host_action,
 )
 
@@ -218,53 +212,15 @@ def _lifecycle_argv(binary: str, verb: str, agent: str, username: str) -> list[s
     return argv
 
 
-def _run(argv: list[str], stdin: Optional[str] = None) -> subprocess.CompletedProcess:
+def _run(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
         argv,
-        input=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         timeout=COMMAND_TIMEOUT_SECONDS,
         check=False,
     )
-
-
-def _env_argv(binary: str, verb: str, key: str, agent_dir: str) -> list[str]:
-    """``clawmeets env <verb> KEY --agent <dir name> --data-dir <data dir>``.
-
-    The agent is named by its exact directory name from this account's own
-    roster, not by short name: ``clawmeets env`` resolves ``--agent`` by prefix,
-    so ``backend`` could also match ``backend-v2``, and a short name alone could
-    match another account's agent. The directory is the one the page showed.
-
-    ``set`` never gets the value on its argument list — ``--value-stdin`` reads
-    it from stdin, so it is not visible to other users in ``ps``.
-    """
-    path = Path(agent_dir)
-    argv = [binary, "env", verb, key, "--agent", path.name, "--data-dir", str(path.parent.parent)]
-    if verb == "set":
-        argv.append("--value-stdin")
-    return argv
-
-
-def _env_change(
-    binary: str, action: str, agent: str, key: str, value: Optional[str], username: str
-) -> CommandResult:
-    """Add/replace or remove one key in one agent's env-var store.
-
-    Every detail string names the key and never the value: it goes to the log
-    and back to the page. The CLI's own output is key-only too (``env set``
-    prints ``{"status": "ok", "key": …}``), so its tail is safe to relay.
-    """
-    row = next((r for r in snapshot(username) if r["short_name"] == agent), None)
-    if row is None:
-        return CommandResult(False, f"{agent} is not set up on this computer")
-    if action == "env_set":
-        proc = _run(_env_argv(binary, "set", key, row["dir"]), stdin=value)
-        return _lifecycle_result(proc, f"Set {key} on {agent}")
-    proc = _run(_env_argv(binary, "unset", key, row["dir"]))
-    return _lifecycle_result(proc, f"Removed {key} from {agent}")
 
 
 def _tail(output: str, limit: int = 300) -> str:
@@ -277,17 +233,8 @@ def _tail(output: str, limit: int = 300) -> str:
     return cleaned[-limit:] if len(cleaned) > limit else cleaned
 
 
-def execute(
-    action: str,
-    agent: Optional[str],
-    username: str,
-    key: Optional[str] = None,
-    value: Optional[str] = None,
-) -> CommandResult:
+def execute(action: str, agent: Optional[str], username: str) -> CommandResult:
     """Run one allowlisted action. Never raises.
-
-    ``key`` / ``value`` are read only by the env actions; ``value`` is a secret
-    and must not reach a log line or a result.
 
     The allowlist is checked HERE, on the machine, even though the server
     already refused anything unlisted before sending. That redundancy is the
@@ -302,7 +249,6 @@ def execute(
     """
     try:
         cleaned, agent_name = validate_host_action(action, agent)
-        env_key, env_value = validate_env_change(cleaned, key, value)
     except HostCommandRejected as e:
         return CommandResult(False, f"Refused: {e}")
 
@@ -349,11 +295,6 @@ def execute(
 
         if cleaned == "update":
             return update_self(username)
-
-        if cleaned in ("env_set", "env_unset"):
-            return _env_change(
-                binary, cleaned, agent_name, env_key, env_value, username
-            )
 
     except subprocess.TimeoutExpired:
         return CommandResult(
