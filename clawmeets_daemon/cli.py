@@ -206,6 +206,10 @@ def install(
         help="Also start the connection automatically when you log in.",
     ),
     user: Optional[str] = _USER_OPTION,
+    repair: bool = typer.Option(
+        False, "--repair",
+        help="Pair again even if this computer's saved key still works.",
+    ),
 ) -> None:
     """Connect this computer to your ClawMeets account.
 
@@ -222,10 +226,12 @@ def install(
     second account on the same machine pairs separately and gets its own key,
     its own connection and its own computer page; neither disturbs the other.
 
-    Re-running for an account that is ALREADY connected creates a SECOND record
-    for the same machine, because the server has no way to recognize a machine
-    it has never spoken to. If you paired by mistake, disconnect the duplicate
-    from the web app.
+    Safe to re-run. When this account already has a saved key for the same
+    server and the server still lists that computer, nothing is paired: the
+    login entry and the connection are just made sure of. A key that was
+    revoked (the computer was disconnected from the web) pairs again, and the
+    connection still holding the old key is stopped first so it cannot linger
+    as an offline twin. ``--repair`` forces a new pairing.
     """
     username = (user or cfg.local_username()).strip()
     session = cfg.read_user_session(username)
@@ -246,6 +252,14 @@ def install(
         )
         raise typer.Exit(1)
     cfg.use_account(username)
+
+    existing = cfg.read_config()
+    if existing and existing.server_url.rstrip("/") == server_url and not code and not repair:
+        if _saved_key_still_listed(existing, session):
+            typer.echo(f"Already connected as {username} on {server_url}.")
+            _finish_install(username, autostart_after, start_after)
+            return
+        typer.echo("This computer's saved key was disconnected; pairing again.")
 
     # No code given: fetch one with the account's own session. This is the path
     # the one-line installer takes, and the reason it is one line.
@@ -303,6 +317,10 @@ def install(
         raise typer.Exit(1)
 
     body = response.json()
+    # The new key replaces the old one. A connection still running with the
+    # old key would keep printing "Already connected" while the web app shows
+    # it offline forever, so stop it before writing the new config.
+    stop_pid(cfg.pid_path())
     saved = cfg.write_config(cfg.ComputerConfig(
         host_id=body["host_id"],
         token=body["token"],
@@ -312,7 +330,56 @@ def install(
     typer.echo(f"Connected as \"{body.get('name') or machine['hostname']}\".")
     typer.echo(f"  Account:   {username}")
     typer.echo(f"  Key stored at {saved} (only you can read it)")
+    _finish_install(username, autostart_after, start_after)
 
+
+def _saved_key_still_listed(
+    existing: cfg.ComputerConfig, session: Optional[cfg.UserSession]
+) -> bool:
+    """Does the server still list the computer this account's saved key belongs to?
+
+    True on 200, False on 404 (disconnected from the web: the key is dead and a
+    new pairing is the remedy). Anything else exits: pairing without knowing is
+    exactly what creates a duplicate computer, so "could not tell" must never
+    fall through to it.
+    """
+    if session is None:
+        typer.echo(
+            f'No saved sign-in found for "{existing.username}", so this '
+            "computer's saved key cannot be checked.\n"
+            f"Sign in first (`clawmeets user login {existing.username}`), or "
+            "pair anyway: `clawmeets computer install --repair`.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    try:
+        response = httpx.get(
+            f"{existing.server_url.rstrip('/')}/me/computers/{existing.host_id}",
+            headers={"Authorization": f"Bearer {session.token}"},
+            timeout=30,
+        )
+    except httpx.HTTPError as e:
+        response = None
+        reason = str(e)
+    else:
+        if response.status_code == 200:
+            return True
+        if response.status_code == 404:
+            return False
+        reason = f"HTTP {response.status_code}"
+        if response.status_code == 401:
+            reason += f"; your sign-in may have expired: `clawmeets user login {existing.username}`"
+    typer.echo(
+        f"Could not confirm this computer's saved key with {existing.server_url} "
+        f"({reason}).\nRe-run once the server is reachable, or pair anyway: "
+        "`clawmeets computer install --repair`.",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+def _finish_install(username: str, autostart_after: bool, start_after: bool) -> None:
+    """The part of ``install`` that runs whether or not it just paired."""
     # Autostart BEFORE starting: registering is the step that can report a
     # problem, and a user reading this output should see it next to the pairing
     # it belongs to rather than after a "connected" line that looks like the end.

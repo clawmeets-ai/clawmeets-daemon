@@ -53,6 +53,7 @@ will not come back by itself, and the caller gets a sentence saying so.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import plistlib
 import shutil
@@ -177,8 +178,39 @@ def _login_path() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _data_dir_tag() -> str:
+    """A short, stable tag for a non-default data dir, else "".
+
+    ``CLAWMEETS_DATA_DIR`` is how one machine keeps test, staging and prod side
+    by side, and the same username can exist in each. Without a tag their login
+    entries would share one name and the second install would replace the
+    first's. The default data dir gets no tag, so existing entries keep their
+    names and nothing needs migrating. ``clawmeets/doctor.py`` re-derives this.
+    """
+    data_dir = cfg.data_dir().expanduser().resolve()
+    if data_dir == (Path.home() / ".clawmeets").resolve():
+        return ""
+    return hashlib.sha1(str(data_dir).encode()).hexdigest()[:8]
+
+
+def _login_env() -> dict[str, str]:
+    """Environment for the login-started process.
+
+    Carries ``CLAWMEETS_DATA_DIR`` when it is not the default: launchd and
+    systemd start with a bare environment, so without it a connection set up
+    in another data dir would look in ``~/.clawmeets`` after a reboot and find
+    no key.
+    """
+    env = {"PATH": _login_path()}
+    if _data_dir_tag():
+        env["CLAWMEETS_DATA_DIR"] = str(cfg.data_dir().expanduser().resolve())
+    return env
+
+
 def _launchd_label(account: str) -> str:
-    return f"{LABEL_PREFIX}.{account}" if account else LABEL_PREFIX
+    label = f"{LABEL_PREFIX}.{account}" if account else LABEL_PREFIX
+    tag = _data_dir_tag()
+    return f"{label}.{tag}" if tag else label
 
 
 def _launchd_path(account: str) -> Path:
@@ -201,7 +233,7 @@ def _launchd_plist(account: str) -> dict:
     return {
         "Label": _launchd_label(account),
         "ProgramArguments": _run_argv(account),
-        "EnvironmentVariables": {"PATH": _login_path()},
+        "EnvironmentVariables": _login_env(),
         "RunAtLoad": True,
         "ProcessType": "Background",
         "StandardOutPath": str(stdout_log),
@@ -291,7 +323,9 @@ def _launchd_status(account: str) -> AutostartState:
 
 
 def _systemd_unit(account: str) -> str:
-    return f"{SYSTEMD_PREFIX}-{account}.service" if account else f"{SYSTEMD_PREFIX}.service"
+    name = f"{SYSTEMD_PREFIX}-{account}" if account else SYSTEMD_PREFIX
+    tag = _data_dir_tag()
+    return f"{name}-{tag}.service" if tag else f"{name}.service"
 
 
 def _systemd_path(account: str) -> Path:
@@ -319,8 +353,11 @@ def _systemd_text(account: str) -> str:
         "Type=simple\n"
         f"ExecStart={argv}\n"
         # Quoted whole, with `%` doubled: systemd expands `%` specifiers here.
-        f'Environment="PATH={_login_path().replace("%", "%%")}"\n'
-        f"WorkingDirectory={Path.home()}\n"
+        + "".join(
+            f'Environment="{key}={value.replace("%", "%%")}"\n'
+            for key, value in _login_env().items()
+        )
+        + f"WorkingDirectory={Path.home()}\n"
         "\n"
         "[Install]\n"
         "WantedBy=default.target\n"
